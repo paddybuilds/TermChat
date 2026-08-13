@@ -19,7 +19,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             executable: termchat
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             executable: termchat
           - os: macos-latest
@@ -27,7 +27,7 @@ jobs:
             executable: termchat
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -44,7 +44,7 @@ jobs:
           Copy-Item README.md,LICENSE $archiveRoot
           Compress-Archive -Path $archiveRoot -DestinationPath "$archiveRoot.zip"
           (Get-FileHash "$archiveRoot.zip" -Algorithm SHA256).Hash.ToLower() + "  $archiveRoot.zip" | Set-Content "$archiveRoot.zip.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: termchat-${{ matrix.target }}
           path: |
@@ -55,7 +55,7 @@ jobs:
     needs: binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo publish --locked
         env:
@@ -65,7 +65,7 @@ jobs:
     needs: binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v6
         with:
           pattern: termchat-*
           merge-multiple: true

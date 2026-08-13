@@ -1,5 +1,7 @@
 ![TermChat - Live chat. Right in your terminal.](assets/termchat-banner.png)
 
+[![CI](https://github.com/paddybuilds/TermChat/actions/workflows/ci.yml/badge.svg)](https://github.com/paddybuilds/TermChat/actions/workflows/ci.yml)
+
 # TermChat
 
 TermChat is a lightweight, read-only terminal UI for following Twitch and Kick chat. Watch several channels side by side without signing in, while keeping native emotes, 7TV emotes, badges, and moderation events visible in a fast keyboard-driven interface.

@@ -3,20 +3,80 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
+      - run: cargo fmt --all -- --check
       - run: cargo test --all-targets --locked
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            executable: termchat.exe
+            archive: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            executable: termchat
+            archive: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            executable: termchat
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            executable: termchat
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package Windows build
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $archiveRoot = "termchat-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $archiveRoot | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.executable }}" $archiveRoot
+          Copy-Item README.md,LICENSE $archiveRoot
+          Compress-Archive -Path $archiveRoot -DestinationPath "$archiveRoot.zip"
+      - name: Package Unix build
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          archive_root="termchat-${{ matrix.target }}"
+          mkdir "$archive_root"
+          cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" README.md LICENSE "$archive_root/"
+          tar -czf "$archive_root.tar.gz" "$archive_root"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: termchat-${{ matrix.target }}
+          path: termchat-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 14
