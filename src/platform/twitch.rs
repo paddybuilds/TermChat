@@ -8,14 +8,14 @@ use tokio_util::sync::CancellationToken;
 use twitch_irc::{
     ClientConfig, SecureTCPTransport, TwitchIRCClient,
     login::StaticLoginCredentials,
-    message::{PrivmsgMessage, ServerMessage},
+    message::{ClearChatAction, ClearChatMessage, PrivmsgMessage, ServerMessage},
 };
 
 use crate::{
     emotes::SharedEmoteRegistry,
-    model::{ChatEvent, ChatMessage, RgbColor},
+    model::{ChatBadge, ChatEvent, ChatMessage, ModerationEvent, RgbColor},
     platform::PlatformAdapter,
-    seventv::SevenTvClient,
+    seventv::{SevenTvClient, SevenTvPlatform},
     target::TwitchTarget,
     tls::install_crypto_provider,
 };
@@ -52,7 +52,15 @@ impl TwitchAdapter {
         let registry = self.emotes.clone();
         let client = SevenTvClient::new();
         *task = Some(tokio::spawn(async move {
-            client.run(room_id, registry, events, cancellation).await;
+            client
+                .run(
+                    SevenTvPlatform::Twitch,
+                    room_id,
+                    registry,
+                    events,
+                    cancellation,
+                )
+                .await;
         }));
     }
 }
@@ -126,6 +134,28 @@ impl PlatformAdapter for TwitchAdapter {
                             return Ok(());
                         }
                     }
+                    ServerMessage::ClearMsg(message) => {
+                        if events
+                            .send(ChatEvent::Moderation(ModerationEvent::MessageDeleted {
+                                message_id: message.message_id,
+                                sender: Some(message.sender_login),
+                                moderator: None,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
+                    ServerMessage::ClearChat(message) => {
+                        if events
+                            .send(ChatEvent::Moderation(convert_clear_chat(message)))
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
                     ServerMessage::Reconnect(_) => {
                         events
                             .send(ChatEvent::Status("Twitch requested a reconnect".to_owned()))
@@ -185,9 +215,43 @@ fn convert_message(message: PrivmsgMessage, emotes: &SharedEmoteRegistry) -> Cha
     });
     ChatMessage {
         id: message.message_id,
+        sender_id: Some(message.sender.id),
         sender: message.sender.name,
         color,
+        badges: message
+            .badges
+            .into_iter()
+            .map(|badge| ChatBadge {
+                name: badge.name,
+                version: Some(badge.version),
+            })
+            .collect(),
         fragments: emotes.parse_message(&message.message_text, &message.emotes),
+        moderation: None,
+    }
+}
+
+fn convert_clear_chat(message: ClearChatMessage) -> ModerationEvent {
+    match message.action {
+        ClearChatAction::ChatCleared => ModerationEvent::ChatCleared { moderator: None },
+        ClearChatAction::UserBanned {
+            user_login,
+            user_id,
+        } => ModerationEvent::UserBanned {
+            user_id: Some(user_id),
+            user: user_login,
+            moderator: None,
+        },
+        ClearChatAction::UserTimedOut {
+            user_login,
+            user_id,
+            timeout_length,
+        } => ModerationEvent::UserTimedOut {
+            user_id: Some(user_id),
+            user: user_login,
+            duration_seconds: Some(timeout_length.as_secs()),
+            moderator: None,
+        },
     }
 }
 
@@ -195,25 +259,57 @@ fn convert_message(message: PrivmsgMessage, emotes: &SharedEmoteRegistry) -> Cha
 mod tests {
     use std::convert::TryFrom;
 
-    use twitch_irc::message::{IRCMessage, PrivmsgMessage};
+    use twitch_irc::message::{ClearChatMessage, IRCMessage, PrivmsgMessage};
 
     use super::*;
     use crate::model::{ChatFragment, EmoteProvider};
 
     #[test]
     fn converts_irc_message_and_twitch_emote() {
-        let raw = "@badge-info=;badges=;color=#1E90FF;display-name=Tester;emotes=25:3-7;flags=;id=message-id;room-id=123;subscriber=0;tmi-sent-ts=1594545155039;turbo=0;user-id=29803735;user-type= :tester!tester@tester.tmi.twitch.tv PRIVMSG #channel :hi Kappa";
+        let raw = "@badge-info=subscriber/18;badges=moderator/1,subscriber/12;color=#1E90FF;display-name=Tester;emotes=25:3-7;flags=;id=message-id;room-id=123;subscriber=1;tmi-sent-ts=1594545155039;turbo=0;user-id=29803735;user-type=mod :tester!tester@tester.tmi.twitch.tv PRIVMSG #channel :hi Kappa";
         let irc = IRCMessage::parse(raw).unwrap();
         let message = PrivmsgMessage::try_from(irc).unwrap();
 
         let converted = convert_message(message, &SharedEmoteRegistry::default());
 
         assert_eq!(converted.sender, "Tester");
+        assert_eq!(converted.sender_id.as_deref(), Some("29803735"));
         assert_eq!(converted.color.unwrap().blue, 0xFF);
+        assert_eq!(converted.badges[0].name, "moderator");
+        assert_eq!(converted.badges[1].version.as_deref(), Some("12"));
         assert!(matches!(
             &converted.fragments[1],
             ChatFragment::Emote(emote) if emote.provider == EmoteProvider::Twitch
         ));
+    }
+
+    #[test]
+    fn converts_timeout_and_ban_events() {
+        let timeout = IRCMessage::parse("@ban-duration=600;room-id=111;target-user-id=42;tmi-sent-ts=1594553828245 :tmi.twitch.tv CLEARCHAT #channel :alice").unwrap();
+        let timeout = convert_clear_chat(ClearChatMessage::try_from(timeout).unwrap());
+        assert_eq!(
+            timeout,
+            ModerationEvent::UserTimedOut {
+                user_id: Some("42".to_owned()),
+                user: "alice".to_owned(),
+                duration_seconds: Some(600),
+                moderator: None,
+            }
+        );
+
+        let ban = IRCMessage::parse("@room-id=111;target-user-id=42;tmi-sent-ts=1594553828245 :tmi.twitch.tv CLEARCHAT #channel :alice").unwrap();
+        let ban = convert_clear_chat(ClearChatMessage::try_from(ban).unwrap());
+        assert!(matches!(ban, ModerationEvent::UserBanned { user, .. } if user == "alice"));
+    }
+
+    #[test]
+    fn converts_chat_clear_event() {
+        let clear = IRCMessage::parse(
+            "@room-id=111;tmi-sent-ts=1594553828245 :tmi.twitch.tv CLEARCHAT #channel",
+        )
+        .unwrap();
+        let clear = convert_clear_chat(ClearChatMessage::try_from(clear).unwrap());
+        assert_eq!(clear, ModerationEvent::ChatCleared { moderator: None });
     }
 
     #[tokio::test]

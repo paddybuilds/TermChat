@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::ChatEvent;
 
+pub mod kick;
 pub mod twitch;
 
 #[async_trait]

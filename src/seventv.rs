@@ -9,13 +9,28 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    emotes::{RegistryIds, SharedEmoteRegistry},
+    emotes::{RegistryIds, SharedEmoteRegistry, SharedGlobalEmotes},
     model::{ChatEvent, EmoteProvider, EmoteRef},
     tls::install_crypto_provider,
 };
 
 const DEFAULT_API_BASE: &str = "https://7tv.io/v3";
-const DEFAULT_EVENT_URL: &str = "wss://events.7tv.io/v3?app=termchat&version=0.1.0";
+const DEFAULT_EVENT_URL: &str = "wss://events.7tv.io/v3?app=termchat&version=0.5.0";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SevenTvPlatform {
+    Twitch,
+    Kick,
+}
+
+impl SevenTvPlatform {
+    const fn api_name(self) -> &'static str {
+        match self {
+            Self::Twitch => "twitch",
+            Self::Kick => "kick",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SevenTvClient {
@@ -34,7 +49,10 @@ impl SevenTvClient {
     pub fn new() -> Self {
         install_crypto_provider();
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("valid 7TV HTTP client"),
             api_base: DEFAULT_API_BASE.to_owned(),
             event_url: DEFAULT_EVENT_URL.to_owned(),
         }
@@ -44,7 +62,10 @@ impl SevenTvClient {
     fn with_api_base(api_base: String) -> Self {
         install_crypto_provider();
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("valid 7TV test HTTP client"),
             api_base,
             event_url: DEFAULT_EVENT_URL.to_owned(),
         }
@@ -52,13 +73,16 @@ impl SevenTvClient {
 
     pub async fn run(
         &self,
-        twitch_room_id: String,
+        platform: SevenTvPlatform,
+        platform_user_id: String,
         registry: SharedEmoteRegistry,
         events: mpsc::Sender<ChatEvent>,
         cancellation: CancellationToken,
     ) {
-        self.refresh_global(&registry, &events).await;
-        self.refresh_channel(&twitch_room_id, &registry, &events)
+        if !registry.has_global_emotes() {
+            self.refresh_global(&registry, &events).await;
+        }
+        self.refresh_channel(platform, &platform_user_id, &registry, &events)
             .await;
 
         let mut retry = Duration::from_secs(1);
@@ -68,7 +92,14 @@ impl SevenTvClient {
             }
             let ids = registry.snapshot_ids();
             match self
-                .run_event_connection(&twitch_room_id, &registry, &events, &cancellation, ids)
+                .run_event_connection(
+                    platform,
+                    &platform_user_id,
+                    &registry,
+                    &events,
+                    &cancellation,
+                    ids,
+                )
                 .await
             {
                 Ok(()) if cancellation.is_cancelled() => return,
@@ -88,15 +119,25 @@ impl SevenTvClient {
                 () = sleep(retry + Duration::from_millis(jitter)) => {}
             }
             retry = (retry * 2).min(Duration::from_secs(30));
-            self.refresh_global(&registry, &events).await;
-            self.refresh_channel(&twitch_room_id, &registry, &events)
+            if !registry.has_global_emotes() {
+                self.refresh_global(&registry, &events).await;
+            }
+            self.refresh_channel(platform, &platform_user_id, &registry, &events)
                 .await;
         }
     }
 
+    pub async fn load_global(&self, global: &SharedGlobalEmotes) -> Result<usize> {
+        let set = self.fetch_set("global").await?;
+        let count = set.emotes.len();
+        global.replace(set.id, set.emotes);
+        Ok(count)
+    }
+
     async fn run_event_connection(
         &self,
-        twitch_room_id: &str,
+        platform: SevenTvPlatform,
+        platform_user_id: &str,
         registry: &SharedEmoteRegistry,
         events: &mpsc::Sender<ChatEvent>,
         cancellation: &CancellationToken,
@@ -139,7 +180,8 @@ impl SevenTvClient {
                     }
                     DispatchTarget::User => {
                         let old_set = ids.channel_set_id.clone();
-                        self.refresh_channel(twitch_room_id, registry, events).await;
+                        self.refresh_channel(platform, platform_user_id, registry, events)
+                            .await;
                         ids = registry.snapshot_ids();
                         if ids.channel_set_id != old_set {
                             // Reconnect so the new set replaces the old subscription cleanly.
@@ -173,11 +215,12 @@ impl SevenTvClient {
 
     async fn refresh_channel(
         &self,
-        twitch_room_id: &str,
+        platform: SevenTvPlatform,
+        platform_user_id: &str,
         registry: &SharedEmoteRegistry,
         events: &mpsc::Sender<ChatEvent>,
     ) {
-        match self.fetch_channel(twitch_room_id).await {
+        match self.fetch_channel(platform, platform_user_id).await {
             Ok(Some(channel)) => {
                 registry.replace_channel(channel.user_id, channel.set.id, channel.set.emotes)
             }
@@ -235,10 +278,19 @@ impl SevenTvClient {
         parse_set(&value)
     }
 
-    async fn fetch_channel(&self, twitch_room_id: &str) -> Result<Option<ParsedChannel>> {
+    async fn fetch_channel(
+        &self,
+        platform: SevenTvPlatform,
+        platform_user_id: &str,
+    ) -> Result<Option<ParsedChannel>> {
         let response = self
             .http
-            .get(format!("{}/users/twitch/{twitch_room_id}", self.api_base))
+            .get(format!(
+                "{}/users/{}/{}",
+                self.api_base,
+                platform.api_name(),
+                platform_user_id
+            ))
             .send()
             .await
             .context("request 7TV channel")?;
@@ -304,7 +356,7 @@ fn parse_emote(value: &Value) -> Option<EmoteRef> {
         .unwrap_or(false);
     let host = data.pointer("/host/url")?.as_str()?;
     let files = data.pointer("/host/files")?.as_array()?;
-    let file_name = ["2x.webp", "1x.webp"]
+    let file_name = ["4x.webp", "3x.webp", "2x.webp", "1x.webp"]
         .into_iter()
         .find(|wanted| {
             files
@@ -400,20 +452,24 @@ mod tests {
                 "animated": false,
                 "host": {
                     "url": "//cdn.7tv.app/emote/01ABC",
-                    "files": [{"name": "1x.webp"}, {"name": "2x.webp"}]
+                    "files": [
+                        {"name": "1x.webp"},
+                        {"name": "2x.webp"},
+                        {"name": "4x.webp"}
+                    ]
                 }
             }
         })
     }
 
     #[test]
-    fn parses_emote_set_and_prefers_two_x_webp() {
+    fn parses_emote_set_and_prefers_highest_resolution_webp() {
         let set = parse_set(&json!({"id": "set", "emotes": [emote_json()]})).unwrap();
         assert_eq!(set.id, "set");
         assert_eq!(set.emotes[0].name, "Wave");
         assert_eq!(
             set.emotes[0].image_url,
-            "https://cdn.7tv.app/emote/01ABC/2x.webp"
+            "https://cdn.7tv.app/emote/01ABC/4x.webp"
         );
     }
 
@@ -429,6 +485,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loads_global_emotes_into_a_shared_registry() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/emote-sets/global"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "global-set",
+                "emotes": [emote_json()]
+            })))
+            .mount(&server)
+            .await;
+        let client = SevenTvClient::with_api_base(server.uri());
+        let global = SharedGlobalEmotes::default();
+
+        assert_eq!(client.load_global(&global).await.unwrap(), 1);
+
+        let registry = SharedEmoteRegistry::with_global(global);
+        assert_eq!(registry.resolve("Wave").unwrap().id, "01ABC");
+        assert_eq!(
+            registry.snapshot_ids().global_set_id.as_deref(),
+            Some("global-set")
+        );
+    }
+
+    #[tokio::test]
     async fn fetches_channel_from_configurable_api() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -441,10 +521,35 @@ mod tests {
             .await;
         let client = SevenTvClient::with_api_base(server.uri());
 
-        let channel = client.fetch_channel("123").await.unwrap().unwrap();
+        let channel = client
+            .fetch_channel(SevenTvPlatform::Twitch, "123")
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(channel.user_id, "user");
         assert_eq!(channel.set.emotes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetches_kick_channel_from_platform_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/kick/676"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "676",
+                "user": {"id": "user"},
+                "emote_set": {"id": "set", "emotes": [emote_json()]}
+            })))
+            .mount(&server)
+            .await;
+        let client = SevenTvClient::with_api_base(server.uri());
+        let channel = client
+            .fetch_channel(SevenTvPlatform::Kick, "676")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(channel.set.id, "set");
     }
 
     #[tokio::test]
@@ -452,7 +557,11 @@ mod tests {
     async fn live_api_and_eventapi_smoke() {
         let client = SevenTvClient::new();
         let global = client.fetch_set("global").await.unwrap();
-        let channel = client.fetch_channel("11148817").await.unwrap().unwrap();
+        let channel = client
+            .fetch_channel(SevenTvPlatform::Twitch, "11148817")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!global.emotes.is_empty());
         assert!(!channel.set.emotes.is_empty());
 
@@ -469,6 +578,7 @@ mod tests {
 
         client
             .run_event_connection(
+                SevenTvPlatform::Twitch,
                 "11148817",
                 &registry,
                 &events,
@@ -477,5 +587,16 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Kick and 7TV connectivity"]
+    async fn live_kick_channel_smoke() {
+        let channel = SevenTvClient::new()
+            .fetch_channel(SevenTvPlatform::Kick, "676")
+            .await
+            .unwrap()
+            .expect("xqc should have a Kick-linked 7TV account");
+        assert!(!channel.set.emotes.is_empty());
     }
 }

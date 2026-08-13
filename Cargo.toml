@@ -1,12 +1,12 @@
 [package]
 name = "termchat-live"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A lightweight, read-only terminal viewer for livestream chat"
+description = "A lightweight, read-only terminal viewer for Twitch and Kick chat"
 license = "MIT"
 documentation = "https://docs.rs/termchat-live"
-keywords = ["twitch", "chat", "terminal", "tui", "7tv"]
+keywords = ["twitch", "kick", "chat", "terminal", "tui"]
 categories = ["command-line-utilities"]
 
 [[bin]]
@@ -30,7 +30,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-tokio = { version = "1.48", features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.48", features = ["fs", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 twitch-irc = { version = "6.1", default-features = false, features = ["transport-tcp-rustls-native-roots"] }

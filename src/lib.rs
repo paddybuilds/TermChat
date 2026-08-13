@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod cli;
+pub mod config;
 pub mod emotes;
 pub mod image_store;
 pub mod model;

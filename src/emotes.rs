@@ -9,43 +9,142 @@ use twitch_irc::message::Emote as TwitchEmote;
 use crate::model::{ChatFragment, EmoteProvider, EmoteRef};
 
 #[derive(Clone, Debug, Default)]
-pub struct SharedEmoteRegistry(Arc<RwLock<EmoteRegistry>>);
+pub struct SharedGlobalEmotes(Arc<RwLock<GlobalEmotes>>);
+
+#[derive(Clone, Debug)]
+pub struct SharedEmoteRegistry {
+    global: SharedGlobalEmotes,
+    channel: Arc<RwLock<ChannelEmotes>>,
+}
+
+impl Default for SharedEmoteRegistry {
+    fn default() -> Self {
+        Self::with_global(SharedGlobalEmotes::default())
+    }
+}
 
 impl SharedEmoteRegistry {
-    pub fn replace_global(&self, set_id: String, emotes: Vec<EmoteRef>) {
-        let mut registry = self.0.write().unwrap_or_else(|error| error.into_inner());
-        registry.global_set_id = Some(set_id);
-        registry.global = by_name(emotes);
-    }
-
-    pub fn replace_channel(&self, user_id: String, set_id: String, emotes: Vec<EmoteRef>) {
-        let mut registry = self.0.write().unwrap_or_else(|error| error.into_inner());
-        registry.user_id = Some(user_id);
-        registry.channel_set_id = Some(set_id);
-        registry.channel = by_name(emotes);
-    }
-
-    pub fn snapshot_ids(&self) -> RegistryIds {
-        let registry = self.0.read().unwrap_or_else(|error| error.into_inner());
-        RegistryIds {
-            user_id: registry.user_id.clone(),
-            global_set_id: registry.global_set_id.clone(),
-            channel_set_id: registry.channel_set_id.clone(),
+    pub fn with_global(global: SharedGlobalEmotes) -> Self {
+        Self {
+            global,
+            channel: Arc::new(RwLock::new(ChannelEmotes::default())),
         }
     }
 
-    pub fn resolve(&self, name: &str) -> Option<EmoteRef> {
-        let registry = self.0.read().unwrap_or_else(|error| error.into_inner());
-        registry
+    pub fn replace_global(&self, set_id: String, emotes: Vec<EmoteRef>) {
+        self.global.replace(set_id, emotes);
+    }
+
+    pub fn replace_channel(&self, user_id: String, set_id: String, emotes: Vec<EmoteRef>) {
+        let mut registry = self
             .channel
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        registry.user_id = Some(user_id);
+        registry.channel_set_id = Some(set_id);
+        registry.emotes = by_name(emotes);
+    }
+
+    pub fn snapshot_ids(&self) -> RegistryIds {
+        let global = self
+            .global
+            .0
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let channel = self
+            .channel
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        RegistryIds {
+            user_id: channel.user_id.clone(),
+            global_set_id: global.set_id.clone(),
+            channel_set_id: channel.channel_set_id.clone(),
+        }
+    }
+
+    pub fn has_global_emotes(&self) -> bool {
+        self.global
+            .0
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_id
+            .is_some()
+    }
+
+    pub fn resolve(&self, name: &str) -> Option<EmoteRef> {
+        let channel = self
+            .channel
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(emote) = channel.emotes.get(name) {
+            return Some(emote.clone());
+        }
+        self.global
+            .0
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .emotes
             .get(name)
-            .or_else(|| registry.global.get(name))
             .cloned()
     }
 
     pub fn parse_message(&self, text: &str, twitch_emotes: &[TwitchEmote]) -> Vec<ChatFragment> {
         parse_message(text, twitch_emotes, |name| self.resolve(name))
     }
+
+    pub fn parse_kick_message(&self, text: &str) -> Vec<ChatFragment> {
+        parse_kick_message(text, |name| self.resolve(name))
+    }
+}
+
+impl SharedGlobalEmotes {
+    pub fn replace(&self, set_id: String, emotes: Vec<EmoteRef>) {
+        let mut global = self.0.write().unwrap_or_else(|error| error.into_inner());
+        global.set_id = Some(set_id);
+        global.emotes = by_name(emotes);
+    }
+}
+
+pub fn parse_kick_message<F>(text: &str, mut resolve_seventv: F) -> Vec<ChatFragment>
+where
+    F: FnMut(&str) -> Option<EmoteRef>,
+{
+    const PREFIX: &str = "[emote:";
+    let mut fragments = Vec::new();
+    let mut cursor = 0;
+    let mut scan = 0;
+    while let Some(relative_start) = text[scan..].find(PREFIX) {
+        let start = scan + relative_start;
+        let Some(relative_end) = text[start..].find(']') else {
+            break;
+        };
+        let end = start + relative_end + 1;
+        let body = &text[start + PREFIX.len()..end - 1];
+        let Some((id, name)) = body.split_once(':') else {
+            scan = end;
+            continue;
+        };
+        if id.is_empty()
+            || !id.chars().all(|character| character.is_ascii_digit())
+            || name.is_empty()
+        {
+            scan = end;
+            continue;
+        }
+
+        push_seventv_text(&mut fragments, &text[cursor..start], &mut resolve_seventv);
+        fragments.push(ChatFragment::Emote(EmoteRef {
+            provider: EmoteProvider::Kick,
+            id: id.to_owned(),
+            name: name.to_owned(),
+            image_url: format!("https://files.kick.com/emotes/{id}/fullsize"),
+            animated: false,
+        }));
+        cursor = end;
+        scan = end;
+    }
+    push_seventv_text(&mut fragments, &text[cursor..], &mut resolve_seventv);
+    coalesce_text(fragments)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -56,12 +155,16 @@ pub struct RegistryIds {
 }
 
 #[derive(Clone, Debug, Default)]
-struct EmoteRegistry {
-    global: HashMap<String, EmoteRef>,
-    channel: HashMap<String, EmoteRef>,
+struct GlobalEmotes {
+    set_id: Option<String>,
+    emotes: HashMap<String, EmoteRef>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ChannelEmotes {
     user_id: Option<String>,
-    global_set_id: Option<String>,
     channel_set_id: Option<String>,
+    emotes: HashMap<String, EmoteRef>,
 }
 
 fn by_name(emotes: Vec<EmoteRef>) -> HashMap<String, EmoteRef> {
@@ -240,5 +343,65 @@ mod tests {
             vec![seventv("Same", "channel")],
         );
         assert_eq!(registry.resolve("Same").unwrap().id, "channel");
+    }
+
+    #[test]
+    fn globals_are_shared_across_channels_while_channel_sets_stay_isolated() {
+        let global = SharedGlobalEmotes::default();
+        let first = SharedEmoteRegistry::with_global(global.clone());
+        let second = SharedEmoteRegistry::with_global(global.clone());
+        global.replace("global".to_owned(), vec![seventv("Global", "global")]);
+        first.replace_channel(
+            "first-user".to_owned(),
+            "first-set".to_owned(),
+            vec![seventv("Local", "local")],
+        );
+
+        assert_eq!(first.resolve("Global").unwrap().id, "global");
+        assert_eq!(second.resolve("Global").unwrap().id, "global");
+        assert_eq!(first.resolve("Local").unwrap().id, "local");
+        assert!(second.resolve("Local").is_none());
+        assert_eq!(
+            second.snapshot_ids().global_set_id.as_deref(),
+            Some("global")
+        );
+        assert_eq!(second.snapshot_ids().channel_set_id, None);
+    }
+
+    #[test]
+    fn kick_emotes_take_precedence_over_seventv_and_keep_unicode() {
+        let fragments = parse_kick_message("😀 [emote:123:Wave] Wave [emote:123:Wave]", |name| {
+            (name == "Wave").then(|| seventv("Wave", "7"))
+        });
+        assert_eq!(
+            fragments
+                .iter()
+                .filter(|fragment| matches!(fragment, ChatFragment::Emote(emote) if emote.provider == EmoteProvider::Kick))
+                .count(),
+            2
+        );
+        assert!(fragments.iter().any(
+            |fragment| matches!(fragment, ChatFragment::Emote(emote) if emote.provider == EmoteProvider::SevenTv)
+        ));
+    }
+
+    #[test]
+    fn malformed_kick_markup_remains_text() {
+        let fragments = parse_kick_message("before [emote:nope:Wave] after [emote:12", |_| None);
+        assert_eq!(
+            fragments,
+            vec![ChatFragment::Text(
+                "before [emote:nope:Wave] after [emote:12".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn kick_emotes_have_distinct_cache_keys() {
+        let fragments = parse_kick_message("[emote:123:Wave]", |_| None);
+        let ChatFragment::Emote(emote) = &fragments[0] else {
+            panic!("expected emote");
+        };
+        assert_eq!(emote.cache_key(), "kick-123");
     }
 }

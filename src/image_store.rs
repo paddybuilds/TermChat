@@ -1,4 +1,4 @@
-use std::{collections::HashSet, num::NonZeroUsize, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Duration};
 
 use directories::ProjectDirs;
 use image::DynamicImage;
@@ -9,16 +9,21 @@ use tokio::sync::mpsc;
 
 use crate::{cache::DiskCache, model::EmoteRef, tls::install_crypto_provider};
 
-pub const EMOTE_WIDTH: u16 = 4;
-pub const EMOTE_HEIGHT: u16 = 2;
+// Half-block rendering produces one horizontal sample per column and two vertical
+// samples per row. A 6x3 cell box therefore retains 6x6 samples instead of the
+// previous 4x4, while remaining compact enough for a chat feed.
+pub const EMOTE_WIDTH: u16 = 6;
+pub const EMOTE_HEIGHT: u16 = 3;
 const DISK_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const DECODED_CACHE_ITEMS: usize = 128;
 
 pub struct ImageStore {
     picker: Option<Picker>,
+    enabled: bool,
     cache: Arc<DiskCache>,
     protocols: LruCache<String, Protocol>,
     pending: HashSet<String>,
+    failed: HashSet<String>,
     completed_tx: mpsc::UnboundedSender<ImageResult>,
     completed_rx: mpsc::UnboundedReceiver<ImageResult>,
 }
@@ -29,43 +34,64 @@ struct ImageResult {
 }
 
 impl ImageStore {
-    pub fn new(picker: Option<Picker>) -> Self {
+    pub fn new(picker: Option<Picker>, enabled: bool) -> Self {
         install_crypto_provider();
         let (completed_tx, completed_rx) = mpsc::unbounded_channel();
         Self {
             picker,
+            enabled,
             cache: Arc::new(DiskCache::new(
                 default_cache_dir(),
                 DISK_CACHE_BYTES,
-                reqwest::Client::new(),
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(15))
+                    .build()
+                    .expect("valid emote HTTP client"),
             )),
             protocols: LruCache::new(NonZeroUsize::new(DECODED_CACHE_ITEMS).unwrap()),
             pending: HashSet::new(),
+            failed: HashSet::new(),
             completed_tx,
             completed_rx,
         }
     }
 
     pub fn enabled(&self) -> bool {
+        self.enabled && self.picker.is_some()
+    }
+
+    pub fn supported(&self) -> bool {
         self.picker.is_some()
     }
 
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
     pub fn contains(&self, key: &str) -> bool {
-        self.protocols.contains(key)
+        self.enabled() && self.protocols.contains(key)
+    }
+
+    pub fn is_settled(&self, key: &str) -> bool {
+        !self.enabled() || self.protocols.contains(key) || self.failed.contains(key)
     }
 
     pub fn protocol(&mut self, key: &str) -> Option<&Protocol> {
+        if !self.enabled() {
+            return None;
+        }
         self.protocols.get(key)
     }
 
     pub fn request(&mut self, emote: &EmoteRef) {
-        if emote.animated || self.picker.is_none() {
+        if !self.enabled() {
             return;
         }
         let key = emote.cache_key();
         if self.protocols.contains(&key) || !self.pending.insert(key.clone()) {
             return;
         }
+        self.failed.remove(&key);
 
         let cache = Arc::clone(&self.cache);
         let picker = self.picker.clone().expect("picker checked above");
@@ -92,9 +118,13 @@ impl ImageStore {
             self.pending.remove(&completed.key);
             match completed.result {
                 Ok(protocol) => {
+                    self.failed.remove(&completed.key);
                     self.protocols.put(completed.key, protocol);
                 }
-                Err(error) => errors.push(error),
+                Err(error) => {
+                    self.failed.insert(completed.key);
+                    errors.push(error);
+                }
             }
         }
         errors
