@@ -15,6 +15,10 @@ TermChat is a lightweight, read-only terminal UI for following Twitch and Kick c
 - Persistent channels, image preferences, and badge preferences
 - Automatic reconnects with per-channel connection status
 
+## Preview
+
+![TermChat displaying live Twitch chat in a terminal workspace](terminal.png)
+
 ## Coming soon
 
 - YouTube Live Chat support alongside Twitch and Kick
@@ -133,6 +137,10 @@ cargo build --release
 ```
 
 The public chat model, target model, and `PlatformAdapter` trait are platform-neutral, allowing additional chat transports to be added without changing the feed renderer.
+
+## Acknowledgements
+
+TermChat was inspired by [dmmulroy/cf-twitch](https://github.com/dmmulroy/cf-twitch) after seeing its similar terminal-based setup for a Twitch client.
 
 ## License
 
