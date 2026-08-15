@@ -2778,6 +2778,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "twitch-irc",
+ "unicode-segmentation",
  "unicode-width",
  "url",
  "wiremock",

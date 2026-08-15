@@ -6,7 +6,10 @@ use std::{
 
 use twitch_irc::message::Emote as TwitchEmote;
 
-use crate::model::{ChatFragment, EmoteProvider, EmoteRef};
+use crate::{
+    model::{ChatFragment, EmoteProvider, EmoteRef},
+    text::DisplayTextSanitizer,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct SharedGlobalEmotes(Arc<RwLock<GlobalEmotes>>);
@@ -144,7 +147,7 @@ where
         scan = end;
     }
     push_seventv_text(&mut fragments, &text[cursor..], &mut resolve_seventv);
-    coalesce_text(fragments)
+    sanitize_text_fragments(coalesce_text(fragments))
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -217,7 +220,21 @@ where
         cursor = range.end;
     }
     push_seventv_text(&mut fragments, &text[cursor..], &mut resolve_seventv);
-    coalesce_text(fragments)
+    sanitize_text_fragments(coalesce_text(fragments))
+}
+
+fn sanitize_text_fragments(fragments: Vec<ChatFragment>) -> Vec<ChatFragment> {
+    let mut sanitizer = DisplayTextSanitizer::chat_message();
+    fragments
+        .into_iter()
+        .filter_map(|fragment| match fragment {
+            ChatFragment::Text(text) => {
+                let text = sanitizer.sanitize(&text);
+                (!text.is_empty()).then_some(ChatFragment::Text(text))
+            }
+            emote => Some(emote),
+        })
+        .collect()
 }
 
 fn char_boundaries(text: &str) -> Vec<usize> {
@@ -392,6 +409,22 @@ mod tests {
             fragments,
             vec![ChatFragment::Text(
                 "before [emote:nope:Wave] after [emote:12".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn chat_text_is_sanitized_after_emote_parsing() {
+        let fragments = parse_kick_message(
+            "hello\x1b\u{202E} a\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}",
+            |_| None,
+        );
+
+        assert_eq!(
+            fragments,
+            vec![ChatFragment::Text(
+                "hello a\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}"
+                    .to_owned()
             )]
         );
     }

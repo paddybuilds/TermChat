@@ -27,7 +27,8 @@ use ratatui_image::{
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     cli::{BadgeMode, ImageMode},
@@ -1312,23 +1313,23 @@ fn push_text(
     text: &str,
     style: Style,
 ) {
-    for character in text.chars() {
-        if character == '\n' {
+    for grapheme in text.graphemes(true) {
+        if grapheme == "\n" {
             rows.push(std::mem::replace(row, FeedRow::new()));
             *x = 0;
             continue;
         }
-        let char_width = character.width().unwrap_or(0).min(u16::MAX as usize) as u16;
-        if char_width > 0 && *x > 0 && x.saturating_add(char_width) > width {
+        let grapheme_width = grapheme.width().min(u16::MAX as usize) as u16;
+        if grapheme_width > 0 && *x > 0 && x.saturating_add(grapheme_width) > width {
             rows.push(std::mem::replace(row, FeedRow::new()));
             *x = 0;
         }
-        append_text_item(row, *x, character, style);
-        *x = x.saturating_add(char_width).min(width);
+        append_text_item(row, *x, grapheme, style);
+        *x = x.saturating_add(grapheme_width).min(width);
     }
 }
 
-fn append_text_item(row: &mut FeedRow, x: u16, character: char, style: Style) {
+fn append_text_item(row: &mut FeedRow, x: u16, grapheme: &str, style: Style) {
     if let Some(RowItem::Text {
         x: previous_x,
         value,
@@ -1337,12 +1338,12 @@ fn append_text_item(row: &mut FeedRow, x: u16, character: char, style: Style) {
         && *previous_style == style
         && previous_x.saturating_add(value.width() as u16) == x
     {
-        value.push(character);
+        value.push_str(grapheme);
         return;
     }
     row.items.push(RowItem::Text {
         x,
-        value: character.to_string(),
+        value: grapheme.to_owned(),
         style,
     });
 }
@@ -1494,6 +1495,38 @@ mod tests {
         );
         assert!(rows.len() >= 2);
         assert!(matches!(rows[0].items[0], RowItem::Text { .. }));
+    }
+
+    #[test]
+    fn text_layout_measures_joined_emoji_as_graphemes() {
+        let mut rows = Vec::new();
+        let mut row = FeedRow::new();
+        let mut x = 0;
+
+        push_text(&mut rows, &mut row, &mut x, 20, "👨‍👩‍👧‍👦x", Style::default());
+
+        assert_eq!(x, "👨‍👩‍👧‍👦x".width() as u16);
+        assert_eq!(rows.len(), 0);
+        assert!(matches!(
+            &row.items[..],
+            [RowItem::Text { x: 0, value, .. }] if value == "👨‍👩‍👧‍👦x"
+        ));
+    }
+
+    #[test]
+    fn joined_emoji_wraps_as_one_indivisible_glyph() {
+        let mut rows = Vec::new();
+        let mut row = FeedRow::new();
+        let mut x = 0;
+
+        push_text(&mut rows, &mut row, &mut x, 2, "a👨‍👩‍👧‍👦", Style::default());
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(x, 2);
+        assert!(matches!(
+            &row.items[..],
+            [RowItem::Text { x: 0, value, .. }] if value == "👨‍👩‍👧‍👦"
+        ));
     }
 
     #[test]

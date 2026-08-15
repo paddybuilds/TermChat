@@ -16,6 +16,7 @@ use crate::{
     platform::PlatformAdapter,
     seventv::{SevenTvClient, SevenTvPlatform},
     target::KickTarget,
+    text::sanitize_display_name,
     tls::install_crypto_provider,
 };
 
@@ -375,7 +376,7 @@ fn convert_message(message: KickChatPayload, emotes: &SharedEmoteRegistry) -> Ch
     ChatMessage {
         id: message.id,
         sender_id: scalar_string(&message.sender.id),
-        sender: message.sender.username,
+        sender: sanitize_display_name(&message.sender.username),
         color: RgbColor::from_hex(&message.sender.identity.color),
         badges,
         fragments: emotes.parse_kick_message(&message.content),

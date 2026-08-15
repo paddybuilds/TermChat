@@ -17,6 +17,7 @@ use crate::{
     platform::PlatformAdapter,
     seventv::{SevenTvClient, SevenTvPlatform},
     target::TwitchTarget,
+    text::sanitize_display_name,
     tls::install_crypto_provider,
 };
 
@@ -216,7 +217,7 @@ fn convert_message(message: PrivmsgMessage, emotes: &SharedEmoteRegistry) -> Cha
     ChatMessage {
         id: message.message_id,
         sender_id: Some(message.sender.id),
-        sender: message.sender.name,
+        sender: sanitize_display_name(&message.sender.name),
         color,
         badges: message
             .badges
