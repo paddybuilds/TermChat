@@ -7,5 +7,6 @@ pub mod model;
 pub mod platform;
 pub mod seventv;
 pub mod target;
+mod text;
 mod tls;
 pub mod tui;
